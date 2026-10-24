@@ -13,6 +13,80 @@ import (
 	"github.com/yetone/magpie/internal/agentenv"
 )
 
+// A key of a provider given its team (#236) can hold a plan of its own
+// too: a member with a personal GLM Coding plan beside the team's seat
+// answers the personal quota endpoint with it, and the provider says
+// which plan is meant — the team's is read first, the member's own only
+// when the team's can't be.
+func TestZhipuTeamBeforeTheMembersOwnPlan(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+	personal := 0
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path != "/api/monitor/usage/quota/limit" {
+			t.Errorf("asked %s", r.URL.Path)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("type") != "2" {
+			// the member's own plan, a real one with windows
+			personal++
+			w.Write([]byte(`{"code":200,"success":true,"data":{"level":"pro","limits":[
+				{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":12,"nextResetTime":1790000000000}]}}`))
+			return
+		}
+		if r.Header.Get("Bigmodel-Organization") != "org-1" || r.Header.Get("Bigmodel-Project") != "proj-1" {
+			t.Errorf("team asked with org %q project %q", r.Header.Get("Bigmodel-Organization"), r.Header.Get("Bigmodel-Project"))
+			w.Write([]byte(`{"code":1001,"msg":"no team","success":false}`))
+			return
+		}
+		w.Write([]byte(`{"code":200,"success":true,"data":{"limits":[
+			{"type":"CREDIT_LIMIT","unit":3,"percentage":42,"nextResetTime":1790000000000},
+			{"type":"CREDIT_LIMIT","unit":6,"percentage":10,"nextResetTime":1790500000000}]}}`))
+	}))
+	defer srv.Close()
+	old := http.DefaultClient.Transport
+	http.DefaultClient.Transport = rewrite{srv}
+	t.Cleanup(func() { http.DefaultClient.Transport = old })
+	forget := func() {
+		planQuotaCache.Lock()
+		planQuotaCache.data = nil
+		planQuotaCache.Unlock()
+	}
+	forget()
+	t.Cleanup(forget)
+
+	if err := Save(Provider{ID: "both", Name: "Both", Chat: "https://open.bigmodel.cn/api/coding/paas/v4", Key: "k", ZhipuTeam: &ZhipuTeam{"org-1", "proj-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]SubscriptionQuota{}
+	for _, q := range PlanQuotas(context.Background()) {
+		got[q.Provider] = q
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	q, ok := got["both"]
+	if !ok || q.Error != "" || q.Plan != "GLM Coding Team" || len(q.Windows) != 2 ||
+		q.Windows[0].Name != "5 hours" || q.Windows[0].Used != 42 ||
+		q.Windows[1].Name != "7 days" || q.Windows[1].Used != 10 {
+		t.Fatalf("card: %+v", q)
+	}
+	if personal != 0 {
+		t.Fatalf("the member's own plan was asked %d times", personal)
+	}
+}
+
 // #236: a Zhipu key on a team's GLM Coding Plan, added as a key and not
 // through ZCode, has the team's organization and project typed into its
 // provider: its windows are asked with type=2 and those two headers. A

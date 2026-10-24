@@ -609,6 +609,18 @@ func planKeyWindows(ctx context.Context, p Provider, src planQuotaSource, key st
 		plan, ws, err = cmdKeyWindows(ctx, src, key)
 		return plan, ws, false, err
 	}
+	// a provider given its team (#236) is that team's first: a GLM account
+	// holds a personal plan and a team seat at once, and a member's key
+	// answers the personal quota endpoint with the member's own plan, so
+	// the provider says which plan is meant. A key the team's endpoint
+	// doesn't serve is asked as any other (the team is not asked twice).
+	if t := p.ZhipuTeam.normal(); t != nil && t.Org != "" && t.Project != "" && strings.HasSuffix(src.url, "/api/monitor/usage/quota/limit") {
+		if tplan, tws, terr := zhipuKeyTeamWindows(ctx, src.url, key, t); terr == nil && len(tws) > 0 {
+			return tplan, tws, true, nil
+		}
+		plan, ws, err = planWindows(ctx, src, key)
+		return plan, ws, false, err
+	}
 	plan, ws, err = planWindows(ctx, src, key)
 	// a key refused is refused as a team's too
 	if zhipu := strings.HasSuffix(src.url, "/api/monitor/usage/quota/limit"); zhipu && (err != nil || len(ws) == 0) && !zhipuKeyRefusedErr(err) {
